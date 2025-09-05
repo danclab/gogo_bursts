@@ -1,0 +1,6 @@
+{
+    "dataset_path": "/home/common/bonaiuto/gogo_bursts",
+    "downsample_dataset": 600,
+    "low_pass_filter": 120,
+    "high_pass_filter": 0.1
+}
