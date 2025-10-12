@@ -1,44 +1,167 @@
-import csv
-import os
 import sys
 import json
 import numpy as np
 import matplotlib.pyplot as plt
 import os.path as op
 
+import mne
 from mne import pick_channels_regexp
 from mne.io.ctf.trans import _make_ctf_coord_trans_set
 from mne.transforms import apply_trans
-
-from utilities import files
-import mne
 from mne.annotations import events_from_annotations
 
-def run(group, subject_id, json_file):
+import pandas as pd
+
+from utilities import files
+
+def pair_stim_resp_strict(stim_idx, stim_samples, resp_samples, cond_name):
+    """
+    Pair each STIM with the first subsequent RESP.
+    Enforces 1:1 matching and raises ValueError if any mismatch occurs.
+    Returns (stim_idx_aligned, stim_samp_aligned, resp_samp_aligned).
+    """
+    stim_idx = np.asarray(stim_idx)
+    stim_samples = np.asarray(stim_samples)
+    resp_samples = np.asarray(resp_samples)
+
+    # Basic count check
+    if len(stim_samples) != len(resp_samples):
+        raise ValueError(
+            f"[{cond_name}] Count mismatch: {len(stim_samples)} STIM vs {len(resp_samples)} RESP."
+        )
+
+    # Ensure RESP are in ascending time
+    resp_samples = np.sort(resp_samples, kind='mergesort')
+
+    aligned_idx, aligned_stim, aligned_resp = [], [], []
+    j = 0
+    n_resp = len(resp_samples)
+
+    for idx, s in zip(stim_idx, stim_samples):
+        # advance until first RESP strictly after this STIM
+        while j < n_resp and resp_samples[j] <= s:
+            j += 1
+        if j >= n_resp:
+            raise ValueError(
+                f"[{cond_name}] No RESP found after STIM at sample {int(s)} (trial_idx={int(idx)})."
+            )
+        aligned_idx.append(idx)
+        aligned_stim.append(s)
+        aligned_resp.append(resp_samples[j])
+        j += 1
+
+    # Final bijection check
+    if len(aligned_idx) != len(stim_samples):
+        raise ValueError(
+            f"[{cond_name}] Pairing failure: paired {len(aligned_idx)} of {len(stim_samples)} trials."
+        )
+
+    return np.asarray(aligned_idx), np.asarray(aligned_stim), np.asarray(aligned_resp)
+
+
+def run(subject_id, json_file):
     # opening a json file
     with open(json_file) as pipeline_file:
         parameters = json.load(pipeline_file)
     path = parameters["dataset_path"]
     sfreq = parameters["downsample_dataset"]
-    data_path = op.join(path, "data", group)
-    der_path = op.join(path, "derivatives")
+    data_path = op.join(path, "data_v2")
+    der_path = op.join(path, "derivatives_v2")
     files.make_folder(der_path)
 
-    proc_path = op.join(der_path, "processed", group)
+    proc_path = op.join(der_path, "processed")
     files.make_folder(proc_path)
+
+    raw_fname = op.join(data_path, f'{subject_id}_GOGO-raw.fif')
+    if not op.exists(raw_fname):
+        return None
 
     print("ID:", subject_id)
 
     sub_path = op.join(proc_path, subject_id)
+    if not op.exists(sub_path):
+        return None
+
     files.make_folder(sub_path)
 
     qc_folder = op.join(sub_path, "QC")
     files.make_folder(qc_folder)
 
-    raw = mne.io.read_raw_fif(op.join(data_path, f'{subject_id}_GOGO-raw.fif'))
+
+    raw = mne.io.read_raw_fif(raw_fname, preload=True)
     raw.rename_channels(lambda x: x.replace('-3907', '').replace('-3908', ''))
 
     raw_events, event_id = events_from_annotations(raw)
+
+    # Event codes
+    RESP_LONG = event_id['RESP/LONG']
+    RESP_SHORT = event_id['RESP/SHORT']
+    STIM_LONG = event_id['STIM/LONG']
+    STIM_SHORT = event_id['STIM/SHORT']
+
+    # Identify consecutive responses and drop the 2nd (and further) in each run
+    codes = raw_events[:, 2]
+    is_resp = np.isin(codes, [RESP_LONG, RESP_SHORT])
+
+    # current is RESP and immediately previous is RESP -> drop current
+    prev_is_resp = np.r_[False, is_resp[:-1]]
+    drop_mask = is_resp & prev_is_resp
+    keep_mask = ~drop_mask
+
+    if drop_mask.any():
+        n_drop_total = int(drop_mask.sum())
+        n_drop_long = int(((codes == RESP_LONG) & drop_mask).sum())
+        n_drop_short = int(((codes == RESP_SHORT) & drop_mask).sum())
+        print(f"[CLEAN] Removed {n_drop_total} consecutive RESP events "
+              f"(LONG: {n_drop_long}, SHORT: {n_drop_short}).")
+
+    raw_events = raw_events[keep_mask, :]
+
+    # Recompute helpers after cleaning
+    sfreq = float(raw.info['sfreq'])
+    codes = raw_events[:, 2]
+    samples = raw_events[:, 0]
+    rows = np.arange(len(raw_events))
+
+    # Trial counter over STIMs only (0-based; add +1 if you prefer 1-based)
+    is_stim = np.isin(codes, [STIM_LONG, STIM_SHORT])
+    stim_rows = rows[is_stim]
+    stim_order = -np.ones(len(raw_events), dtype=int)
+    stim_order[stim_rows] = np.arange(len(stim_rows))
+
+    # Split by condition
+    stim_long_rows = rows[codes == STIM_LONG]
+    stim_short_rows = rows[codes == STIM_SHORT]
+    stim_long_samp = samples[codes == STIM_LONG]
+    stim_short_samp = samples[codes == STIM_SHORT]
+    resp_long_samp = samples[codes == RESP_LONG]
+    resp_short_samp = samples[codes == RESP_SHORT]
+
+    # Strict pairing
+    iL, sL, rL = pair_stim_resp_strict(stim_long_rows, stim_long_samp, resp_long_samp, "LONG")
+    iS, sS, rS = pair_stim_resp_strict(stim_short_rows, stim_short_samp, resp_short_samp, "SHORT")
+
+    # Use the STIM order as trial_idx (add +1 here if you want 1-based)
+    df_long = pd.DataFrame({
+        'subject_id': subject_id,
+        'trial_idx': stim_order[iL],
+        'condition': 'LONG',
+        'response_time': (rL - sL) / sfreq
+    })
+    df_short = pd.DataFrame({
+        'subject_id': subject_id,
+        'trial_idx': stim_order[iS],
+        'condition': 'SHORT',
+        'response_time': (rS - sS) / sfreq
+    })
+
+    behav = pd.concat([df_long, df_short], ignore_index=True)
+    behav = behav.sort_values('trial_idx').reset_index(drop=True)
+    behav = behav[['subject_id', 'trial_idx', 'condition', 'response_time']]
+
+    out_csv = op.join(sub_path, f'{subject_id}-behav.csv')
+    behav.to_csv(out_csv, index=False)
+    print(f"Saved: {out_csv}")
 
     # Find time of last relevant event
     last_sample = raw_events[-1, 0]
@@ -66,7 +189,8 @@ def run(group, subject_id, json_file):
 
     # process the entire run
     time_sl = slice(0, len(raw.times))
-    chpi_data = raw[hpi_picks, time_sl][0]
+    #chpi_data = raw[hpi_picks, time_sl][0]
+    chpi_data = raw.get_data()[hpi_picks, time_sl]
 
     # transforms
     tmp_trans = _make_ctf_coord_trans_set(None, None)
@@ -216,21 +340,15 @@ def run(group, subject_id, json_file):
     print("EVENTS SAVED:", eve_path)
 
 if __name__=='__main__':
-    # try:
-    #     index = int(sys.argv[1])
-    # except:
-    #     print("incorrect arguments")
-    #     sys.exit()
-    #
-    # try:
-    #     json_file = sys.argv[2]
-    #     print("USING:", json_file)
-    # except:
-    #     json_file = "settings.json"
-    #     print("USING:", json_file)
-
     json_file = "settings.json"
-    # run('ASD', 'COM013', json_file)
-    # run('ASD', 'COM023', json_file)
-    # run('TD', 'COM033', json_file)
-    run('TD', 'COM040', json_file)
+    with open(json_file) as pipeline_file:
+        parameters = json.load(pipeline_file)
+    path = parameters["dataset_path"]
+
+    df = pd.read_csv(op.join(path, 'data_v2', 'GOGO_Demographics_2025_COMO.csv'))
+    for subject_id, group in df.loc[:, ["ParticipantID", "Status"]].itertuples(index=False, name=None):
+        run(subject_id, json_file)
+
+    df = pd.read_csv(op.join(path, 'data_v2', 'GOGO_Demographics_2025_Driving.csv'))
+    for subject_id, group in df.loc[:, ["ParticipantID", "Status"]].itertuples(index=False, name=None):
+        run(subject_id, json_file)

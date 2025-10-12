@@ -5,7 +5,7 @@ import matplotlib
 matplotlib.use('Agg')
 from matplotlib import colors
 import os.path as op
-from os import sep
+import pandas as pd
 from utilities import files
 import matplotlib.pylab as plt
 from autoreject import compute_thresholds
@@ -13,25 +13,23 @@ import numpy as np
 
 set_log_level(verbose=False)
 
-def run(group, subject_id, json_file):
+def run(subject_id, json_file):
     # opening a json file
     with open(json_file) as pipeline_file:
         parameters = json.load(pipeline_file)
 
     path = parameters["dataset_path"]
 
-    der_path = op.join(path, "derivatives")
+    der_path = op.join(path, "derivatives_v2")
     files.make_folder(der_path)
-    proc_path = op.join(der_path, "processed", group)
+    proc_path = op.join(der_path, "processed")
     files.make_folder(proc_path)
 
     print("ID:", subject_id)
 
     sub_path = op.join(proc_path, subject_id)
-    files.make_folder(sub_path)
 
     qc_folder = op.join(sub_path, "QC")
-    files.make_folder(qc_folder)
 
     epo_paths = files.get_files(sub_path, subject_id, "-epo.fif")[2]
     epo_paths.sort()
@@ -102,28 +100,15 @@ def run(group, subject_id, json_file):
 
 
 if __name__=='__main__':
-    # parsing command line arguments
-    # try:
-    #     subj_index = int(sys.argv[1])
-    # except:
-    #     print("incorrect arguments")
-    #     sys.exit()
-    #
-    # try:
-    #     sess_index = int(sys.argv[2])
-    # except:
-    #     print("incorrect arguments")
-    #     sys.exit()
-    #
-    # try:
-    #     json_file = sys.argv[3]
-    #     print("USING:", json_file)
-    # except:
-    #     json_file = "settings.json"
-    #     print("USING:", json_file)
-
     json_file = "settings.json"
-    # run('ASD', 'COM013', json_file)
-    # run('ASD', 'COM023', json_file)
-    # run('TD', 'COM033', json_file)
-    run('TD', 'COM040', json_file)
+    with open(json_file) as pipeline_file:
+        parameters = json.load(pipeline_file)
+    path = parameters["dataset_path"]
+
+    df = pd.read_csv(op.join(path, 'data_v2', 'GOGO_Demographics_2025_COMO.csv'))
+    for subject_id, group in df.loc[:, ["ParticipantID", "Status"]].itertuples(index=False, name=None):
+        run(subject_id, json_file)
+
+    df = pd.read_csv(op.join(path, 'data_v2', 'GOGO_Demographics_2025_Driving.csv'))
+    for subject_id, group in df.loc[:, ["ParticipantID", "Status"]].itertuples(index=False, name=None):
+        run(subject_id, json_file)
