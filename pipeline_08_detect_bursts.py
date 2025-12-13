@@ -69,6 +69,7 @@ def run(subject_id, group, json_file):
     }
 
     all_beta_pow = {cluster: {epo_type: {} for epo_type in epoch_types} for cluster in ['ipsi','contra']}
+    all_tf = {cluster: {epo_type: {} for epo_type in epoch_types} for cluster in ['ipsi', 'contra']}
 
     # Burst extraction and analysis
     for epo_type in epoch_types:
@@ -90,7 +91,9 @@ def run(subject_id, group, json_file):
             for cluster in clusters:
 
                 channels_used = clusters[cluster]
+                ch_tf = []
                 ch_beta_pow = []
+
                 for channel in channels_used:
                     # Get data for the current sensor
                     times = condition_epoch.times
@@ -112,6 +115,7 @@ def run(subject_id, group, json_file):
 
                     beta_pow_trials = np.mean(tf_trials[:, (foi >= 13) & (foi <= 30), :], axis=1)
                     ch_beta_pow.append(beta_pow_trials)
+                    ch_tf.append(tf_trials)
 
                     # Compute average power spectral density (PSD)
                     average_psd = np.average(tf_trials, axis=(2, 0))
@@ -169,6 +173,17 @@ def run(subject_id, group, json_file):
                             all_bursts[key] = np.hstack([all_bursts[key], bursts[key]])
 
                 all_beta_pow[cluster][epo_type][condition_name] = np.mean(np.array(ch_beta_pow), axis=0)
+                all_tf[cluster][epo_type][condition_name] = np.mean(np.array(ch_tf), axis=0)
+
+    output_file = op.join(sub_path, f'{subject_id}_tf.npz')
+    np.savez(
+        output_file,
+        subject_id=subject_id,
+        group=group,
+        all_tf=all_tf,
+        time=times,
+        freqs=foi
+    )
 
     output_file = op.join(sub_path, f'{subject_id}_beta_power.npz')
     np.savez(
